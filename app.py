@@ -13,6 +13,10 @@ from urllib3.util.retry import Retry
 
 app = Flask(__name__)
 
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 VERSION_API = "https://ff-version.vercel.app/update"
 DECODER_API = "https://protobuf-decoder-seven.vercel.app/decode"
 JWT_API = "https://macxjwt.vercel.app/get_jwt_token"
@@ -53,16 +57,33 @@ ENDPOINT_HEX_PAYLOADS = {
 
 VERSION_CACHE = {"version": None}
 BASE_LINK = "https://dl.dir.freefiremobile.com/common/"
-VALID_EXTENSIONS = ("png", "jpg", "jpeg", "webp", "gif", "bmp", "ktx", "html", "json", "mp4", "mp3", "wav", "ogg", "webm")
+VALID_EXTENSIONS = (
+    "png", "jpg", "jpeg", "webp", "gif", "bmp", "ktx",
+    "html", "json", "mp4", "mp3", "wav", "ogg", "webm"
+)
+
+# ============================================================
+# HTTP SESSION
+# ============================================================
 
 SESSION = requests.Session()
+
 retry_strategy = Retry(
     total=3,
+    connect=3,
+    read=3,
     backoff_factor=0.5,
     status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET", "POST"]
+    allowed_methods=["GET", "POST"],
+    raise_on_status=False
 )
-adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=50, pool_maxsize=50)
+
+adapter = HTTPAdapter(
+    max_retries=retry_strategy,
+    pool_connections=50,
+    pool_maxsize=50
+)
+
 SESSION.mount("http://", adapter)
 SESSION.mount("https://", adapter)
 
@@ -76,133 +97,401 @@ BASE_HEADERS = {
     "X-Unity-Version": "2022.3.47f1"
 }
 
+# ============================================================
+# JWT SETTINGS
+# ============================================================
+
+# JWT generation can be slow, so do NOT use the old 10-second timeout.
+JWT_CONNECT_TIMEOUT = 10
+JWT_READ_TIMEOUT = 90
+
+# Maximum total time spent waiting for a usable JWT response.
+JWT_TOTAL_WAIT = 120
+
+# If the JWT API responds with HTTP 200 but no token yet,
+# wait this long before asking it again.
+JWT_RETRY_DELAY = 2.0
+
+# Maximum number of additional requests after an empty/incomplete response.
+JWT_MAX_ATTEMPTS = 6
+
+
+def safe_error_text(response):
+    """Extract a useful error from a JWT/API response without crashing."""
+    try:
+        data = response.json()
+
+        if isinstance(data, dict):
+            for key in (
+                "error",
+                "message",
+                "detail",
+                "msg",
+                "reason",
+                "status"
+            ):
+                value = data.get(key)
+                if value not in (None, ""):
+                    return str(value)
+
+            return json.dumps(data, ensure_ascii=False)[:1000]
+
+        if data not in (None, ""):
+            return str(data)[:1000]
+
+    except Exception:
+        pass
+
+    text = (response.text or "").strip()
+    return text[:1000] if text else f"HTTP {response.status_code}"
+
+
+def get_token(region_data, release_version):
+    """
+    Wait properly for the JWT API.
+
+    Behaviour:
+    1. Give the JWT API up to JWT_READ_TIMEOUT seconds to respond.
+    2. If it returns an actual HTTP/API error, stop immediately and return it.
+    3. If it returns 200 but no usable token, retry after a short delay.
+    4. Never silently convert a JWT error into a generic auth failure.
+    5. Stop after JWT_TOTAL_WAIT seconds so the Flask request cannot hang forever.
+
+    Returns:
+        (token, None) on success
+        (None, error_message) on failure
+    """
+
+    url = (
+        f"{JWT_API}"
+        f"?uid={region_data['uid']}"
+        f"&password={region_data['password']}"
+        f"&version={release_version}"
+    )
+
+    started = time.monotonic()
+    last_error = None
+
+    for attempt in range(1, JWT_MAX_ATTEMPTS + 1):
+
+        elapsed = time.monotonic() - started
+        if elapsed >= JWT_TOTAL_WAIT:
+            break
+
+        # Remaining overall time. The read timeout is capped so that
+        # the total wait remains controlled.
+        remaining = max(1, JWT_TOTAL_WAIT - elapsed)
+        read_timeout = min(JWT_READ_TIMEOUT, remaining)
+
+        try:
+            print(
+                f"[JWT] Request {attempt}/{JWT_MAX_ATTEMPTS} "
+                f"for {region_data['uid']} "
+                f"(timeout={read_timeout:.1f}s)"
+            )
+
+            response = SESSION.get(
+                url,
+                timeout=(JWT_CONNECT_TIMEOUT, read_timeout)
+            )
+
+            print(
+                f"[JWT] HTTP {response.status_code} "
+                f"after {time.monotonic() - started:.2f}s"
+            )
+
+            # --------------------------------------------------------
+            # REAL HTTP ERROR
+            # --------------------------------------------------------
+            if response.status_code >= 400:
+                error_text = safe_error_text(response)
+
+                # Retry only temporary server-side errors.
+                if response.status_code in (408, 425, 429, 500, 502, 503, 504):
+                    last_error = (
+                        f"JWT API temporary error "
+                        f"HTTP {response.status_code}: {error_text}"
+                    )
+
+                    if time.monotonic() - started < JWT_TOTAL_WAIT:
+                        time.sleep(JWT_RETRY_DELAY)
+                        continue
+
+                return None, (
+                    f"JWT API returned HTTP {response.status_code}: "
+                    f"{error_text}"
+                )
+
+            # --------------------------------------------------------
+            # SUCCESS RESPONSE
+            # --------------------------------------------------------
+            try:
+                data = response.json()
+            except ValueError:
+                data = None
+
+            if isinstance(data, dict):
+
+                # Token available -> proceed immediately.
+                token = data.get("token")
+
+                if isinstance(token, str):
+                    token = token.strip()
+
+                if token:
+                    print(
+                        f"[JWT] Token received successfully "
+                        f"on attempt {attempt}"
+                    )
+                    return token, None
+
+                # API may explicitly report an application-level error
+                # while still using HTTP 200.
+                api_error = None
+
+                for key in (
+                    "error",
+                    "message",
+                    "detail",
+                    "msg",
+                    "reason"
+                ):
+                    value = data.get(key)
+                    if value not in (None, ""):
+                        api_error = str(value)
+                        break
+
+                if api_error:
+                    return None, f"JWT API error: {api_error}"
+
+            # --------------------------------------------------------
+            # EMPTY / INCOMPLETE RESPONSE
+            # --------------------------------------------------------
+            # HTTP response arrived, but there is no token yet.
+            # Wait and ask again instead of immediately failing.
+            last_error = (
+                "JWT API responded, but no usable token was returned"
+            )
+
+        except requests.exceptions.ReadTimeout:
+            last_error = (
+                f"JWT API did not finish responding within "
+                f"{read_timeout:.1f}s"
+            )
+
+        except requests.exceptions.ConnectTimeout:
+            last_error = "Connection timeout while contacting JWT API"
+
+        except requests.exceptions.ConnectionError as exc:
+            last_error = f"JWT connection error: {str(exc)}"
+
+        except requests.exceptions.RequestException as exc:
+            last_error = f"JWT request error: {str(exc)}"
+
+        except Exception as exc:
+            last_error = f"JWT processing error: {str(exc)}"
+
+        # ------------------------------------------------------------
+        # RETRY EMPTY / TEMPORARY RESPONSE
+        # ------------------------------------------------------------
+        if time.monotonic() - started >= JWT_TOTAL_WAIT:
+            break
+
+        if attempt < JWT_MAX_ATTEMPTS:
+            print(
+                f"[JWT] No usable token yet. "
+                f"Waiting {JWT_RETRY_DELAY}s before retry..."
+            )
+            time.sleep(JWT_RETRY_DELAY)
+
+    total = time.monotonic() - started
+
+    return None, (
+        f"JWT token was not received after {total:.1f}s. "
+        f"{last_error or 'Unknown JWT API error'}"
+    )
+
+
+# ============================================================
+# HELPERS
+# ============================================================
 
 def decompress_data(data):
     try:
         return gzip.decompress(data)
     except Exception:
         pass
+
     try:
         return zlib.decompress(data)
     except Exception:
         pass
+
     try:
         return zlib.decompress(data, -zlib.MAX_WBITS)
     except Exception:
         pass
+
     return data
 
 
 def get_release_version():
     if VERSION_CACHE["version"]:
         return VERSION_CACHE["version"]
+
     try:
-        response = SESSION.get(VERSION_API, timeout=8)
+        response = SESSION.get(VERSION_API, timeout=(5, 15))
         response.raise_for_status()
+
         version = response.json().get("latest_release_version")
+
         if version:
             VERSION_CACHE["version"] = version
             return version
-    except Exception:
-        pass
+
+    except Exception as exc:
+        print(f"[VERSION] Failed: {exc}")
+
     return "OB53"
-
-
-def get_token(region_data, release_version):
-    for _ in range(2):
-        try:
-            url = f"{JWT_API}?uid={region_data['uid']}&password={region_data['password']}&version={release_version}"
-            jwt_response = SESSION.get(url, timeout=10)
-            jwt_response.raise_for_status()
-            token = jwt_response.json().get("token")
-            if token:
-                return token
-        except Exception:
-            pass
-    return None
 
 
 def get_payload_for_endpoint(endpoint_name):
     if not endpoint_name:
         return "19d87e64f15e9db87392bc99506f0b94"
+
     clean_name = endpoint_name.strip().lower()
-    return ENDPOINT_HEX_PAYLOADS.get(clean_name, "19d87e64f15e9db87392bc99506f0b94")
+
+    return ENDPOINT_HEX_PAYLOADS.get(
+        clean_name,
+        "19d87e64f15e9db87392bc99506f0b94"
+    )
 
 
 def sanitize_and_format_url(val):
     """
     1. Converts .ff_extend and .ktxp extensions to .jpg.
     2. Strips trailing binary garbage after extension.
-    3. Cleans leading dashes/symbols before folder names (e.g. -OB38 -> OB38).
+    3. Cleans leading dashes/symbols before folder names.
     4. Prepends BASE_LINK for relative paths.
     """
+
     if not val or not isinstance(val, str):
         return None
 
     cleaned = val.strip('\'"* \t\n\r')
+
     if not cleaned:
         return None
 
-    # Convert .ff_extend and .ktxp to .jpg
-    cleaned = re.sub(r'\.ff_extend\b', '.jpg', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\.ktxp\b', '.jpg', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r'\.ff_extend\b',
+        '.jpg',
+        cleaned,
+        flags=re.IGNORECASE
+    )
 
-    ext_pattern = r'(\.(?:png|jpg|jpeg|webp|gif|bmp|ktx|html|json|mp4|mp3|wav|ogg|webm))'
+    cleaned = re.sub(
+        r'\.ktxp\b',
+        '.jpg',
+        cleaned,
+        flags=re.IGNORECASE
+    )
+
+    ext_pattern = (
+        r'(\.(?:png|jpg|jpeg|webp|gif|bmp|ktx|html|json|'
+        r'mp4|mp3|wav|ogg|webm))'
+    )
+
     match = re.search(ext_pattern, cleaned, re.IGNORECASE)
 
     if not match:
         if cleaned.lower().startswith(("http://", "https://")):
             return re.sub(r'[^\x20-\x7E].*$', '', cleaned)
+
         return None
 
     ext_end_idx = match.end()
     remainder = cleaned[ext_end_idx:]
 
-    # Keep valid query string (e.g., ?lang=en or #section)
     if remainder.startswith("?") or remainder.startswith("#"):
-        valid_query = re.match(r'^[\?#a-zA-Z0-9_\-=&%.]+', remainder)
+        valid_query = re.match(
+            r'^[\?#a-zA-Z0-9_\-=&%.]+',
+            remainder
+        )
+
         if valid_query:
-            cleaned = cleaned[:ext_end_idx] + valid_query.group(0)
+            cleaned = (
+                cleaned[:ext_end_idx] +
+                valid_query.group(0)
+            )
         else:
             cleaned = cleaned[:ext_end_idx]
     else:
-        # Cut off binary garbage immediately after extension
         cleaned = cleaned[:ext_end_idx]
 
-    # Clean leading dashes inside absolute URLs (e.g. /common/-OB38/ -> /common/OB38/)
     if cleaned.lower().startswith(("http://", "https://")):
-        cleaned = re.sub(r'/(common|client)/\-+', r'/\1/', cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r'(https?://[^/]+/)\-+', r'\1', cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r'/(common|client)/\-+',
+            r'/\1/',
+            cleaned,
+            flags=re.IGNORECASE
+        )
+
+        cleaned = re.sub(
+            r'(https?://[^/]+/)\-+',
+            r'\1',
+            cleaned,
+            flags=re.IGNORECASE
+        )
+
         return cleaned
 
-    # Clean leading dashes/symbols from relative path (e.g. -OB38/ -> OB38/)
     clean_path = cleaned.lstrip('/- _*+%#@!&:=')
     clean_path = re.sub(r'^\-+', '', clean_path)
 
     if clean_path.lower().startswith("common/"):
-        clean_path = re.sub(r'^common/\-+', 'common/', clean_path, flags=re.IGNORECASE)
+        clean_path = re.sub(
+            r'^common/\-+',
+            'common/',
+            clean_path,
+            flags=re.IGNORECASE
+        )
+
         return "https://dl.dir.freefiremobile.com/" + clean_path
-    else:
-        return BASE_LINK + clean_path
+
+    return BASE_LINK + clean_path
 
 
 def decode_protobuf(raw_hex):
     try:
-        decoder_response = SESSION.post(DECODER_API, json={"data": raw_hex}, timeout=12)
+        decoder_response = SESSION.post(
+            DECODER_API,
+            json={"data": raw_hex},
+            timeout=(5, 30)
+        )
+
         if decoder_response.status_code == 200:
             decoder_json = decoder_response.json()
             protobuf = decoder_json.get("protobuf", {})
+
             if isinstance(protobuf, str):
                 try:
                     protobuf = json.loads(protobuf)
                 except Exception:
                     protobuf = {}
+
             if isinstance(protobuf, dict):
                 return protobuf
-    except Exception:
-        pass
+
+    except Exception as exc:
+        print(f"[DECODER] Failed: {exc}")
+
     return {}
 
+
+# ============================================================
+# ROUTES
+# ============================================================
 
 @app.route("/")
 @app.route("/api")
@@ -216,35 +505,78 @@ def get_version_route():
     try:
         version = get_release_version()
         return jsonify({"version": version})
-    except Exception as e:
-        return jsonify({"version": "OB53", "warning": str(e)})
+
+    except Exception as exc:
+        return jsonify({
+            "version": "OB53",
+            "warning": str(exc)
+        })
 
 
 @app.route("/run_script")
 @app.route("/api/run_script")
 def run_script():
     start_time = time.time()
+
     try:
         server = request.args.get("server", "ind").lower()
         api_name = request.args.get("name")
         version_param = request.args.get("version")
 
         if server not in REGIONS:
-            return jsonify({"error": f"Invalid server region '{server}'"}), 400
+            return jsonify({
+                "error": f"Invalid server region '{server}'"
+            }), 400
 
         if not api_name:
-            return jsonify({"error": "Missing endpoint target parameter 'name'"}), 400
+            return jsonify({
+                "error": "Missing endpoint target parameter 'name'"
+            }), 400
 
-        api_path = urlparse(api_name).path.lstrip("/") if "://" in api_name else api_name.lstrip("/")
+        api_path = (
+            urlparse(api_name).path.lstrip("/")
+            if "://" in api_name
+            else api_name.lstrip("/")
+        )
+
         clean_api_name = api_path.split("/")[-1]
-        payload_hex = get_payload_for_endpoint(clean_api_name)
 
-        release_version = version_param if version_param else get_release_version()
+        payload_hex = get_payload_for_endpoint(
+            clean_api_name
+        )
+
+        release_version = (
+            version_param
+            if version_param
+            else get_release_version()
+        )
+
         region_data = REGIONS[server]
 
-        token = get_token(region_data, release_version)
+        # ========================================================
+        # JWT: WAIT FOR REAL RESPONSE
+        # ========================================================
+
+        token, jwt_error = get_token(
+            region_data,
+            release_version
+        )
+
         if not token:
-            return jsonify({"error": f"Authentication token generation failed for {server.upper()}"}), 401
+            return jsonify({
+                "success": False,
+                "error": jwt_error or (
+                    f"Authentication token generation failed "
+                    f"for {server.upper()}"
+                ),
+                "stage": "jwt",
+                "server": server,
+                "version": release_version
+            }), 502
+
+        # ========================================================
+        # GARANA REQUEST
+        # ========================================================
 
         headers = BASE_HEADERS.copy()
         headers["Authorization"] = f"Bearer {token}"
@@ -254,72 +586,175 @@ def run_script():
 
         try:
             raw_payload = binascii.unhexlify(payload_hex)
-            response = SESSION.post(url, headers=headers, data=raw_payload, timeout=20)
+
+            response = SESSION.post(
+                url,
+                headers=headers,
+                data=raw_payload,
+                timeout=(10, 30)
+            )
+
         except requests.exceptions.Timeout:
-            return jsonify({"error": f"Timeout connecting to Garena server [{server.upper()}]"}), 504
+            return jsonify({
+                "error": (
+                    f"Timeout connecting to Garena server "
+                    f"[{server.upper()}]"
+                ),
+                "stage": "garena"
+            }), 504
+
         except requests.exceptions.RequestException as req_err:
-            return jsonify({"error": f"Garena Connection Fault: {str(req_err)}"}), 502
+            return jsonify({
+                "error": f"Garena Connection Fault: {str(req_err)}",
+                "stage": "garena"
+            }), 502
+
+        # ========================================================
+        # TOKEN REFRESH ON 401
+        # ========================================================
 
         if response.status_code == 401:
-            token = get_token(region_data, release_version)
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
-                response = SESSION.post(url, headers=headers, data=raw_payload, timeout=20)
+            print(
+                f"[GARANA] 401 received for {server.upper()}, "
+                f"refreshing JWT..."
+            )
+
+            token, jwt_error = get_token(
+                region_data,
+                release_version
+            )
+
+            if not token:
+                return jsonify({
+                    "success": False,
+                    "error": (
+                        jwt_error or
+                        "JWT refresh failed after Garena returned 401"
+                    ),
+                    "stage": "jwt_refresh"
+                }), 502
+
+            headers["Authorization"] = f"Bearer {token}"
+
+            try:
+                response = SESSION.post(
+                    url,
+                    headers=headers,
+                    data=raw_payload,
+                    timeout=(10, 30)
+                )
+
+            except requests.exceptions.Timeout:
+                return jsonify({
+                    "error": "Timeout during authenticated retry",
+                    "stage": "garena_retry"
+                }), 504
+
+            except requests.exceptions.RequestException as exc:
+                return jsonify({
+                    "error": f"Garena retry failed: {str(exc)}",
+                    "stage": "garena_retry"
+                }), 502
+
+        # ========================================================
+        # GARANA RESPONSE CHECK
+        # ========================================================
 
         if response.status_code != 200:
-            return jsonify({"error": f"Garena Endpoint returned HTTP {response.status_code}"}), response.status_code
+            return jsonify({
+                "success": False,
+                "error": (
+                    f"Garena Endpoint returned HTTP "
+                    f"{response.status_code}"
+                ),
+                "status_code": response.status_code,
+                "stage": "garena"
+            }), response.status_code
 
         raw_bytes = decompress_data(response.content)
+
         if not raw_bytes:
-            return jsonify({"error": "Empty payload stream returned."}), 204
+            return jsonify({
+                "success": False,
+                "error": "Empty payload stream returned."
+            }), 502
 
         raw_hex = raw_bytes.hex()
         raw_b64 = base64.b64encode(raw_bytes).decode("utf-8")
-        decoded_ascii = raw_bytes.decode("utf-8", errors="ignore")
+        decoded_ascii = raw_bytes.decode(
+            "utf-8",
+            errors="ignore"
+        )
 
         protobuf_data = decode_protobuf(raw_hex)
 
         clean_strings = set()
         urls_set = set()
 
-        # Extract strings from Protobuf JSON
+        # ========================================================
+        # EXTRACT STRINGS FROM PROTOBUF JSON
+        # ========================================================
+
         def extract_from_json_obj(obj):
             if isinstance(obj, dict):
                 for val in obj.values():
                     extract_from_json_obj(val)
+
             elif isinstance(obj, list):
                 for item in obj:
                     extract_from_json_obj(item)
+
             elif isinstance(obj, str):
                 s_val = obj.strip()
+
                 if s_val.startswith(("{", "[")):
                     try:
-                        extract_from_json_obj(json.loads(s_val))
+                        extract_from_json_obj(
+                            json.loads(s_val)
+                        )
                         return
                     except Exception:
                         pass
+
                 formatted = sanitize_and_format_url(s_val)
+
                 if formatted:
                     clean_strings.add(s_val)
                     urls_set.add(formatted)
 
         extract_from_json_obj(protobuf_data)
 
-        # Regex search fallback on raw ASCII string dump
+        # ========================================================
+        # REGEX FALLBACK
+        # ========================================================
+
         found_paths = re.findall(
-            r'(https?://[^\s"\'()<>]+|[\w\-_/]+\.(?:png|jpg|jpeg|webp|gif|bmp|ktx|html|json|mp4|mp3|wav|ogg|webm|ff_extend|ktxp)(?:\d+)?)',
+            r'(https?://[^\s"\'()<>]+|'
+            r'[\w\-_/]+\.(?:png|jpg|jpeg|webp|gif|bmp|ktx|html|'
+            r'json|mp4|mp3|wav|ogg|webm|ff_extend|ktxp)(?:\d+)?)',
             decoded_ascii,
             re.IGNORECASE
         )
+
         for path in found_paths:
             formatted = sanitize_and_format_url(path)
+
             if formatted:
                 clean_strings.add(path.strip())
                 urls_set.add(formatted)
 
         urls_list = sorted(list(urls_set))
-        execution_time_ms = round((time.time() - start_time) * 1000, 2)
-        clean_endpoint_filename = re.sub(r'[^a-zA-Z0-9_\-]', '_', clean_api_name)
+
+        execution_time_ms = round(
+            (time.time() - start_time) * 1000,
+            2
+        )
+
+        clean_endpoint_filename = re.sub(
+            r'[^a-zA-Z0-9_\-]',
+            '_',
+            clean_api_name
+        )
 
         return jsonify({
             "success": True,
@@ -338,17 +773,39 @@ def run_script():
             "raw_response": decoded_ascii
         })
 
-    except Exception as e:
-        return jsonify({"error": f"Internal Script Error: {str(e)}"}), 500
+    except Exception as exc:
+        print(f"[RUN_SCRIPT] Internal error: {exc}")
 
+        return jsonify({
+            "success": False,
+            "error": f"Internal Script Error: {str(exc)}"
+        }), 500
+
+
+# ============================================================
+# CORS
+# ============================================================
 
 @app.after_request
 def after_request(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-    response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = (
+        "Content-Type,Authorization"
+    )
+    response.headers["Access-Control-Allow-Methods"] = (
+        "GET,POST,OPTIONS"
+    )
     return response
 
 
+# ============================================================
+# START
+# ============================================================
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True, threaded=True)
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        debug=True,
+        threaded=True
+    )
