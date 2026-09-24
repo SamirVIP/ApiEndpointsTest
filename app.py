@@ -92,9 +92,9 @@ BASE_HEADERS = {
     "Accept-Encoding": "gzip, deflate",
     "Connection": "keep-alive",
     "Content-Type": "application/x-www-form-urlencoded",
-    "User-Agent": "UnityPlayer/2022.3.47f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+    "User-Agent": "UnityPlayer/2018.4.11f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
     "X-GA": "v1 1",
-    "X-Unity-Version": "2022.3.47f1"
+    "X-Unity-Version": "2018.4.11f1"
 }
 
 # ============================================================
@@ -352,7 +352,7 @@ def get_release_version():
     except Exception as exc:
         print(f"[VERSION] Failed: {exc}")
 
-    return "OB53"
+    return "OB55"
 
 
 def get_payload_for_endpoint(endpoint_name):
@@ -661,14 +661,24 @@ def run_script():
         # ========================================================
 
         if response.status_code != 200:
+            garena_detail = safe_error_text(response)
             return jsonify({
                 "success": False,
                 "error": (
                     f"Garena Endpoint returned HTTP "
-                    f"{response.status_code}"
+                    f"{response.status_code}: {garena_detail}"
                 ),
                 "status_code": response.status_code,
-                "stage": "garena"
+                "stage": "garena",
+                "server": server,
+                "release_version": release_version,
+                "hint": (
+                    "HTTP 401 means Garena rejected the JWT/authentication. "
+                    "If this remains after the OB55/version fix, the JWT "
+                    "provider or its credentials/token-generation flow must "
+                    "be updated; changing the protobuf payload will not fix "
+                    "an authentication rejection."
+                ) if response.status_code == 401 else None
             }), response.status_code
 
         raw_bytes = decompress_data(response.content)
@@ -803,6 +813,8 @@ def after_request(response):
 # ============================================================
 
 if __name__ == "__main__":
+    print("[CONFIG] Garena API fallback release version: OB55")
+    print("[CONFIG] If Garena still returns 401, check/update the JWT API and credentials.")
     app.run(
         host="0.0.0.0",
         port=5000,
