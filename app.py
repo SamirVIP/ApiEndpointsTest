@@ -19,7 +19,7 @@ app = Flask(__name__)
 
 VERSION_API = "https://ff-version.vercel.app/update"
 DECODER_API = "https://protobuf-decoder-seven.vercel.app/decode"
-JWT_API = "https://macxjwt.vercel.app/get_jwt_token"
+JWT_API = "https://jwt-gen-api-lwte.onrender.com/token"
 
 CLIENTS = {
     "client_ind": "https://client.ind.freefiremobile.com",
@@ -92,9 +92,9 @@ BASE_HEADERS = {
     "Accept-Encoding": "gzip, deflate",
     "Connection": "keep-alive",
     "Content-Type": "application/x-www-form-urlencoded",
-    "User-Agent": "UnityPlayer/2018.4.11f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+    "User-Agent": "UnityPlayer/2022.3.47f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
     "X-GA": "v1 1",
-    "X-Unity-Version": "2018.4.11f1"
+    "X-Unity-Version": "2022.3.47f1"
 }
 
 # ============================================================
@@ -103,10 +103,10 @@ BASE_HEADERS = {
 
 # JWT generation can be slow, so do NOT use the old 10-second timeout.
 JWT_CONNECT_TIMEOUT = 10
-JWT_READ_TIMEOUT = 90
+JWT_READ_TIMEOUT = 120
 
 # Maximum total time spent waiting for a usable JWT response.
-JWT_TOTAL_WAIT = 120
+JWT_TOTAL_WAIT = 150
 
 # If the JWT API responds with HTTP 200 but no token yet,
 # wait this long before asking it again.
@@ -162,12 +162,10 @@ def get_token(region_data, release_version):
         (None, error_message) on failure
     """
 
-    url = (
-        f"{JWT_API}"
-        f"?uid={region_data['uid']}"
-        f"&password={region_data['password']}"
-        f"&version={release_version}"
-    )
+    # New JWT API accepts only uid and password.
+    # Do not send the Free Fire release version to this endpoint.
+    from urllib.parse import urlencode
+    url = f"{JWT_API}?{urlencode({'uid': region_data['uid'], 'password': region_data['password']})}"
 
     started = time.monotonic()
     last_error = None
@@ -230,10 +228,31 @@ def get_token(region_data, release_version):
             except ValueError:
                 data = None
 
+            # Some JWT services return the token as plain text instead of JSON.
+            if data is None:
+                plain_token = (response.text or "").strip().strip('"')
+                if plain_token.count(".") == 2 and len(plain_token) > 50:
+                    print(f"[JWT] Plain-text token received on attempt {attempt}")
+                    return plain_token, None
+
+            if isinstance(data, str):
+                plain_token = data.strip()
+                if plain_token.count(".") == 2 and len(plain_token) > 50:
+                    print(f"[JWT] String token received on attempt {attempt}")
+                    return plain_token, None
+
             if isinstance(data, dict):
 
                 # Token available -> proceed immediately.
+                # Accept the normal {"token": "..."} response and a few
+                # common wrappers such as {"data": {"token": "..."}}.
                 token = data.get("token")
+
+                if not token and isinstance(data.get("data"), dict):
+                    token = data["data"].get("token")
+
+                if not token and isinstance(data.get("result"), dict):
+                    token = data["result"].get("token")
 
                 if isinstance(token, str):
                     token = token.strip()
@@ -352,7 +371,7 @@ def get_release_version():
     except Exception as exc:
         print(f"[VERSION] Failed: {exc}")
 
-    return "OB55"
+    return "OB53"
 
 
 def get_payload_for_endpoint(endpoint_name):
@@ -661,24 +680,14 @@ def run_script():
         # ========================================================
 
         if response.status_code != 200:
-            garena_detail = safe_error_text(response)
             return jsonify({
                 "success": False,
                 "error": (
                     f"Garena Endpoint returned HTTP "
-                    f"{response.status_code}: {garena_detail}"
+                    f"{response.status_code}"
                 ),
                 "status_code": response.status_code,
-                "stage": "garena",
-                "server": server,
-                "release_version": release_version,
-                "hint": (
-                    "HTTP 401 means Garena rejected the JWT/authentication. "
-                    "If this remains after the OB55/version fix, the JWT "
-                    "provider or its credentials/token-generation flow must "
-                    "be updated; changing the protobuf payload will not fix "
-                    "an authentication rejection."
-                ) if response.status_code == 401 else None
+                "stage": "garena"
             }), response.status_code
 
         raw_bytes = decompress_data(response.content)
@@ -813,8 +822,6 @@ def after_request(response):
 # ============================================================
 
 if __name__ == "__main__":
-    print("[CONFIG] Garena API fallback release version: OB55")
-    print("[CONFIG] If Garena still returns 401, check/update the JWT API and credentials.")
     app.run(
         host="0.0.0.0",
         port=5000,
